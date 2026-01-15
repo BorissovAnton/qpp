@@ -201,8 +201,8 @@ static TestCase get_testcase(int k) {
             return TestCase{"4-qubit H2 molecule -- initial",
                             "energy should be approx -1.2370004192490118",
                             4,
-                            6,
-                            100,
+                            20,
+                            1024,
                             {
                                 T(-0.81261, "IIII"),
                                 T(0.171201, "ZIII"),
