@@ -33,6 +33,8 @@
 
 #include <qpp/qpp.hpp>
 
+#include <nlopt.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -200,7 +202,7 @@ static TestCase get_testcase(int k) {
                             "energy should be approx -1.2370004192490118",
                             4,
                             6,
-                            4096,
+                            100,
                             {
                                 T(-0.81261, "IIII"),
                                 T(0.171201, "ZIII"),
@@ -293,7 +295,7 @@ static TestCase get_testcase(int k) {
                 "4-qubit LiH molecule",
                 "LiH Hamiltonian (4 qubits) for estimator validation.",
                 4,
-                6,
+                10,
                 4096,
                 {
                     T(-7.49895, "IIII"), T(0.16199, "ZIII"),
@@ -1103,6 +1105,29 @@ static realT exact_ansatz_energy_dense(const std::vector<PauliTerm>& H,
     return static_cast<realT>(std::real(val));
 }
 
+struct NloptCtx {
+    Vqe2Circuit* circ = nullptr;
+    idx n_qubits = 0;
+    int shots = 0;
+    uint64_t base_seed = 0;
+    bool verbose = false;
+    size_t eval_count = 0;
+};
+
+static double nlopt_objective(const std::vector<double>& x,
+                              std::vector<double>& /*grad*/, void* data) {
+    auto* ctx = static_cast<NloptCtx*>(data);
+    StatevectorResource resource(ctx->n_qubits, ctx->base_seed);
+    std::vector<realT> params(x.begin(), x.end());
+    const realT E = ctx->circ->cost_function(params, resource, ctx->shots);
+    if (ctx->verbose) {
+        ++ctx->eval_count;
+        std::cerr << ">> NLOpt eval " << ctx->eval_count
+                  << ": E = " << std::setprecision(12) << E << "\n";
+    }
+    return static_cast<double>(E);
+}
+
 // ------------------------- CLI -------------------------
 
 struct CLI {
@@ -1111,7 +1136,11 @@ struct CLI {
     bool qubitwise = false;
     uint64_t seed = 12345;
     bool verbose = true;
-    int test = 0; // 0 = none, else 1..4
+    int test = 0; // 0 = none, else 1..5
+    bool optimize = false;
+    int maxeval = 200;
+    double xtol_rel = 1e-4;
+    double ftol_rel = 1e-6;
 };
 
 static CLI parse_cli(int argc, char** argv) {
@@ -1128,6 +1157,14 @@ static CLI parse_cli(int argc, char** argv) {
             cli.seed = static_cast<uint64_t>(std::stoull(argv[++i]));
         } else if (a == "--test" && i + 1 < argc) {
             cli.test = std::stoi(argv[++i]);
+        } else if (a == "--opt") {
+            cli.optimize = true;
+        } else if (a == "--maxeval" && i + 1 < argc) {
+            cli.maxeval = std::stoi(argv[++i]);
+        } else if (a == "--xtol" && i + 1 < argc) {
+            cli.xtol_rel = std::stod(argv[++i]);
+        } else if (a == "--ftol" && i + 1 < argc) {
+            cli.ftol_rel = std::stod(argv[++i]);
         } else if (a == "--quiet") {
             cli.verbose = false;
         } else if (a == "--help" || a == "-h") {
@@ -1144,6 +1181,11 @@ static CLI parse_cli(int argc, char** argv) {
                 << "  --seed S            RNG seed\n"
                 << "  --test K            run built-in test Hamiltonian "
                    "K=1..5\n"
+                << "  --opt               enable COBYLA optimization\n"
+                << "  --maxeval N         max optimizer evaluations (default "
+                   "200)\n"
+                << "  --xtol X            relative parameter tolerance\n"
+                << "  --ftol F            relative objective tolerance\n"
                 << "  --quiet             suppress prints\n";
             std::exit(EXIT_SUCCESS);
         } else {
@@ -1196,6 +1238,41 @@ int main(int argc, char** argv) {
     Vqe2Circuit circ(n_qubits, H, cli.qubitwise);
     std::vector<realT> params =
         circ.random_parameters(cli.ansatz_layers, cli.seed);
+
+    if (cli.optimize) {
+        std::vector<double> x(params.begin(), params.end());
+        nlopt::opt opt(nlopt::LN_COBYLA, x.size());
+
+        std::vector<double> lb(x.size(), 0.0);
+        std::vector<double> ub(x.size(), static_cast<double>(qpp::pi));
+        opt.set_lower_bounds(lb);
+        opt.set_upper_bounds(ub);
+
+        NloptCtx ctx;
+        ctx.circ = &circ;
+        ctx.n_qubits = n_qubits;
+        ctx.shots = cli.shots;
+        ctx.base_seed = cli.seed ^ 0xD1B54A32D192ED03ULL;
+        ctx.verbose = cli.verbose;
+        opt.set_min_objective(nlopt_objective, &ctx);
+
+        opt.set_maxeval(cli.maxeval);
+        opt.set_xtol_rel(cli.xtol_rel);
+        opt.set_ftol_rel(cli.ftol_rel);
+
+        double minf = 0.0;
+        nlopt::result r = opt.optimize(x, minf);
+
+        if (cli.verbose) {
+            std::cerr << ">> NLOpt result code: " << static_cast<int>(r)
+                      << "\n";
+            std::cerr << std::setprecision(12)
+                      << ">> Best estimated energy: " << minf << "\n";
+        }
+
+        params.assign(x.begin(), x.end());
+    }
+
     const std::vector<Op> ansatz_ops = circ.build_ansatz_ops(params);
 
     StatevectorResource resource(n_qubits, cli.seed ^ 0x9E3779B97F4A7C15ULL);
@@ -1216,7 +1293,11 @@ int main(int argc, char** argv) {
         std::cerr << ">> Skipping dense exact energies for n_qubits > 12\n";
     }
 
-    const realT E_est = circ.cost_function(params, resource, cli.shots);
+    const realT E_est = [&]() {
+        StatevectorResource eval_resource(n_qubits,
+                                          cli.seed ^ 0x9E3779B97F4A7C15ULL);
+        return circ.cost_function(params, eval_resource, cli.shots);
+    }();
 
     if (cli.verbose) {
         std::cerr << std::setprecision(12);
